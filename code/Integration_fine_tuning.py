@@ -1,12 +1,3 @@
-# conda activate /diazlab/data3/.abhinav/tools/miniconda3/envs/py_r_env
-# pip install ipython
-# pip install scgpt "flash-attn<1.0.5" ## to install scGPT
-# pip install wandb ## for logging and visualization
-# Performing Zero Shot integration
-# This tutorial covers the zero-shot integration with scGPT. This particular workflow works for scRNA-seq datasets without fine-tuning 
-# (or any extensive training) of scGPT.
-# Loading the modules and running it
-# https://github.com/bowang-lab/scGPT/blob/main/tutorials/zero-shot/Tutorial_ZeroShot_Integration.ipynb
 #region loading packages
 import copy
 import gc
@@ -66,55 +57,14 @@ warnings.filterwarnings('ignore')
 
 # adata = sc.read_h5ad("/diazlab/data3/.abhinav/projects/Brain_metastasis/prim_metastasis/saveh5ad/adata_combined.h5ad")
 adata = sc.read_h5ad("/diazlab/data3/.abhinav/projects/Brain_metastasis/prim_metastasis/saveh5ad/adata_combined_processed.h5ad")
-# adata.var["features"] = adata.var.index
-# adata.obs['cellType'] = adata.obs['cellType'].replace('Erythroblast', 'Unknown')
-# adata.obs['Celltypes'] = adata.obs['cellType']
-# adata.obs['Celltypes'] = adata.obs['Celltypes'].replace("Unknown","Unknown_celltypes") ## so that unknown cancer type and cell type should not be same
-# adata.obs['type'] = adata.obs['type'].replace("Unknown","Unknown_cancertype") ## so that unknown cancer type and cell type should not be same
 
-# ### Replacing the Tumor with the different types of the cancers
-# # Make sure both columns are accessible
-# adata.obs['Celltypes'] = adata.obs['Celltypes'].astype(str) ### to remove the categories
-# mask = adata.obs['Celltypes'].str.contains('Tumor', na=False)
-# adata.obs.loc[mask, 'Celltypes'] = adata.obs.loc[mask, 'type']
-# # Keep only rows that do NOT contain "Unknown"
-# adata = adata[~adata.obs['Celltypes'].str.contains("Unknown", na=False)].copy()
-
-# What is Elastic Cell Similarity (ECS)?
-# ECS is a regularization objective that encourages the model to learn a representation space where biologically similar cells stay close — but it does so 
-# elastically, meaning it doesn't force all cells to align equally, just those that should be similar (e.g., same cell type across batches).So the loss is 
-# selective, not global — this avoids over-smoothing or losing batch-specific variation.
-# It tries to minimize distance between pairs of cells whose similarity exceeds the threshold.
-
-# What is dab_weight?
-# dab_weight controls the strength of the DAR (Domain Adversarial Regularization) objective in scGPT.
-#     DAR is a type of batch correction technique.
-#     It works by training a batch classifier adversarially — the model tries to make it hard to distinguish which batch a cell came from.
-#     So the encoder learns batch-invariant features — ideal for downstream integration.
-# The dab_weight parameter sets how much this objective contributes to the overall loss during training/fine-tuning.
-
-# When should you use dab_weight = 1.0?
-# Recommended when:
-#     You're training on many samples (batches), like your 100 BrM samples
-#     Batch effects are non-trivial (different patients, platforms, sites, etc.)
-#     You want cleaner UMAPs, better cell type clustering, or integration-ready embeddings
-
-# mask ratio 40% of the genes for each cell will be masked out, and the model will try to predict their values from the rest.
-# The idea is to force the model to learn contextual relationships between genes — it can’t just memorize values, it has to understand co-expression patterns,
-# gene-gene dependencies, regulatory structure, etc. This helps the model learn a deep biological prior — one that generalizes across cell types, tissues, or disease states.
-
-# Step1: Specifying the hyper-parameter setup for integration task
+# Specifying the hyper-parameter setup for integration task
 hyperparameter_defaults = dict(
     seed=42,
     dataset_name="Brain_Metastasis",
     do_train=True, # Flag to indicate whether to do update model parameters during training
     load_model="/diazlab/data3/.abhinav/projects/Brain_metastasis/scgpt/resources/scGPT_CP/", # Path to pre-trained model
     GEPC=True,  # Gene expression modelling for cell objective
-    # Improves representation learning: the model learns gene dependencies and correlations more deeply.
-    # Acts as regularization, improving generalization to unseen datasets or conditions.
-    # Can improve imputation accuracy, especially for rare genes or dropout-heavy data.
-    # Think of GEPC as a side quest for the model during training:
-    # "Hey model, besides just filling in the blanks, try to understand how genes influence each other and use that understanding to predict expression values too."
     ecs_thres=0.8,  # Elastic cell similarity objective, 0.0 to 1.0, 0.0 to disable
     dab_weight=1.0, # DAR objective weight for batch correction
     mask_ratio=0.4, # Default mask ratio 40% of the genes for each cell will be masked out, and the model will try to predict their values from the rest.
@@ -158,43 +108,11 @@ pad_value = -2 ## 3. pad_value = -2 Used to pad sequences to a fixed length (sin
 n_input_bins = config.n_bins ##  4. n_input_bins = config.n_bins 
 print("Passed Wandb")
 
-# Gene expression values are not fed in as raw floats — they’re discretized into bins (e.g., 0–50), making them token-like.
-# This lets the model treat expression like a language:
-#   Each bin = a “word”
-#   A cell = a “sentence” of gene expressions
-# n_bins=51 is typical for log-normalized values (0–5 scaled into 51 bins).
-
-# Why do we need all this?
-# Because you're fine-tuning a transformer model, and transformers expect:
-#     Tokenized, fixed-length inputs (hence pad_value)
-#     Masked inputs for self-supervised learning (hence mask_ratio & mask_value)
-#     Special tokens for control and interpretation (<cls>, <eoc>)
-#     Discrete vocabularies (hence binning gene expression)
-# scGPT treats gene expression like language, so these settings are critical even if you're just fine-tuning on a real single-cell dataset like breast metastasis.
-
 n_hvg = 3000  # number of highly variable genes
 max_seq_len = n_hvg + 1 ## per_seq_batch_sample = True This controls how batches (cells) are sampled during training.
-# When per_seq_batch_sample = True:
-# Each training sequence (cell) is randomly sampled across batches.
-# It avoids loading multiple full batches at once — instead, it samples cells individually to build a training batch.
 per_seq_batch_sample = True
 DSBN = True  # Domain-spec batchnorm
-# This enables Domain-Specific Batch Normalization, where each domain (e.g., batch, patient, or sample) has its own BatchNorm statistics.
-# Instead of:
-# 1 global mean & variance per feature → you get
-# 1 mean/var per domain (batch/sample)
-# Why it's useful:
-# Helps model batch-specific distributions without mixing them up
-# Prevents distributional drift between batches from hurting performance
-# Improves generalization when combining heterogeneous data sources
 explicit_zero_prob = True  # whether explicit bernoulli for zeros
-# When this is on, the model explicitly models the probability of zero expression using a Bernoulli distribution, separate from non-zero expression modeling.
-# In other words:
-#     The model learns: "Should this gene be zero or non-zero?"
-#     Then, if it's non-zero: "What is its expression level?"
-# This mimics zero-inflated models (like ZINB), which are common in single-cell RNA-seq.
-# Accounts for the dropout effect in scRNA-seq (technical zeros)
-
 dataset_name = config.dataset_name
 save_dir = Path(f"/diazlab/data3/.abhinav/projects/Brain_metastasis/prim_metastasis/fine_tuning/")
 save_dir.mkdir(parents=True, exist_ok=True)
@@ -211,8 +129,7 @@ batch_id_labels = adata.obs["str_batch"].astype("category").cat.codes.values
 adata.obs["batch_id"] = batch_id_labels
 adata.var["gene_name"] = adata.var.index.tolist()
 
-# 2.2 Cross-check gene set with the pre-trained model
-# Note that we retain the common gene set between the data and the pre-trained model for further fine-tuning.
+# Cross-check gene set with the pre-trained model
 if config.load_model is not None:
     model_dir = Path(config.load_model)
     model_config_file = model_dir / "args.json"
@@ -224,22 +141,20 @@ if config.load_model is not None:
             vocab.append_token(s)
     adata.var["id_in_vocab"] = [
         1 if gene in vocab else -1 for gene in adata.var["gene_name"] 
-        # For each gene in adata.var["gene_name"], it checks if it exists in the model’s vocabulary.
-        # Marks it as 1 if yes, -1 if not.
     ]
     gene_ids_in_vocab = np.array(adata.var["id_in_vocab"])
-    logger.info( # Logs how many genes in the current data are recognized by the model's vocabulary.
+    logger.info( 
         f"match {np.sum(gene_ids_in_vocab >= 0)}/{len(gene_ids_in_vocab)} genes "
         f"in vocabulary of size {len(vocab)}."
     )
     adata = adata[:, adata.var["id_in_vocab"] >= 0] ## Keep only the genes that are in the vocabulary
-    # model
+
     with open(model_config_file, "r") as f: # loading model configuration
         model_configs = json.load(f)
     logger.info(
         f"Resume model from {model_file}, the model args will be overriden by the "
         f"config {model_config_file}."
-    )  # Reads architecture-related configs (e.g., embedding size, number of heads) from the JSON file.
+    )  
     embsize = model_configs["embsize"]
     nhead = model_configs["nheads"]
     d_hid = model_configs["d_hid"]
@@ -257,21 +172,21 @@ else:
 # set up the preprocessor, use the args to config the workflow
 # adata.layers['normalized'] = adata.X
 data_is_raw = True
-# preprocessor = Preprocessor(
-#     use_key="X",  # the key in adata.layers to use as raw data
-#     filter_gene_by_counts=3,  # step 1
-#     filter_cell_by_counts=False,  # step 2
-#     normalize_total=1e4,  # 3. whether to normalize the raw data and to what sum
-#     result_normed_key="X_normed",  # the key in adata.layers to store the normalized data
-#     log1p=data_is_raw,  # 4. whether to log1p the normalized data
-#     result_log1p_key="X_log1p",
-#     subset_hvg=n_hvg,  # 5. whether to subset the raw data to highly variable genes
-#     hvg_flavor="seurat_v3" if data_is_raw else "cell_ranger",
-#     # hvg_flavor="cell_ranger",
-#     binning=config.n_bins,  # 6. whether to bin the raw data and to what number of bins
-#     result_binned_key="X_binned",  # the key in adata.layers to store the binned data
-# )
-# preprocessor(adata, batch_key="str_batch" if dataset_name != "Brain_Metastasis" else None)
+preprocessor = Preprocessor(
+    use_key="X",  # the key in adata.layers to use as raw data
+    filter_gene_by_counts=3,  # step 1
+    filter_cell_by_counts=False,  # step 2
+    normalize_total=1e4,  # 3. whether to normalize the raw data and to what sum
+    result_normed_key="X_normed",  # the key in adata.layers to store the normalized data
+    log1p=data_is_raw,  # 4. whether to log1p the normalized data
+    result_log1p_key="X_log1p",
+    subset_hvg=n_hvg,  # 5. whether to subset the raw data to highly variable genes
+    hvg_flavor="seurat_v3" if data_is_raw else "cell_ranger",
+    # hvg_flavor="cell_ranger",
+    binning=config.n_bins,  # 6. whether to bin the raw data and to what number of bins
+    result_binned_key="X_binned",  # the key in adata.layers to store the binned data
+)
+preprocessor(adata, batch_key="str_batch" if dataset_name != "Brain_Metastasis" else None)
 
 if per_seq_batch_sample:
     # sort the adata by batch_id in advance
@@ -513,54 +428,54 @@ wandb.watch(model)
 # sim: Similarity scorer (e.g., for contrastive or triplet learning)
 # creterion_cce: Loss function (CrossEntropy)
 
-# TransformerModel(
-#   (encoder): GeneEncoder(
-#     (embedding): Embedding(60697, 512, padding_idx=60694) # The number 60697 is the size of the gene vocabulary in the pretrained model with 512 dimensions
-#     (enc_norm): LayerNorm((512,), eps=1e-05, elementwise_affine=True) # LayerNorm (short for Layer Normalization) normalizes the inputs across features (the 512 dimensions in your case) for each data point individually.
-#     #  It then applies a learnable scale and bias (elementwise_affine=True) to allow the model to shift/stretch the values as needed. 
-#     # eps is to prevent from normaliztion
-#   )
-#   (value_encoder): ContinuousValueEncoder(
-#     (dropout): Dropout(p=0.2, inplace=False) # Dropout randomly "drops" (sets to zero) a fraction of the neurons in a layer during each forward pass of the model. This forces the model to learn more robust features and prevents the model from becoming too dependent on specific neurons, which can lead to overfitting.
-#     (linear1): Linear(in_features=1, out_features=512, bias=True) ### here it takes 1 gene expression value from each gene for each cell and transforms to 512 dimension provide continous representation of gene expression.
-#     (activation): ReLU() ### This adds the non linearity in the model to learn it in a better way
-#     (linear2): Linear(in_features=512, out_features=512, bias=True)
-#     (norm): LayerNorm((512,), eps=1e-05, elementwise_affine=True)
-#     '''
-#     The ValueEncoder transforms the continuous gene expression values into embeddings that align with the gene embeddings produced by the GeneEncoder. 
-#     These embeddings will help the Transformer model understand the relationships between the genes in terms of both their identity and their expression levels.
-#     '''
-#   )
-#   (batch_encoder): BatchLabelEncoder(
-#     (embedding): Embedding(156, 512) ### 156 batches on 512 dimensions
-#     (enc_norm): LayerNorm((512,), eps=1e-05, elementwise_affine=True)
-#     '''
-#     Instead of applying a single batch normalization layer to the entire input, DomainSpecificBatchNorm1d applies a separate BatchNorm for each batch label (domain). 
-#     This could be useful in situations where you have data from different sources or conditions (i.e., different "domains") and you want to normalize the features
-#     separately for each domain.
-#     '''
-#   (dsbn): DomainSpecificBatchNorm1d(
-#     (bns): ModuleList(
-#       (0-155): 156 x BatchNorm1d(512, eps=6.1e-05, momentum=0.1, affine=False, track_running_stats=True)
-#     )
-#   )
-# #   After the GeneEncoder, ValueEncoder, and BatchEncoder produce their respective embeddings, the outputs are combined. These combined embeddings are fed into the Transformer Encoder, and the Multihead Attention mechanism begins.
-#   (transformer_encoder): TransformerEncoder(
-#     (layers): ModuleList(
-#       (0-11): 12 x TransformerEncoderLayer( # ModuleList: This is a container that holds the 12 Transformer Encoder layers. So, the model has 12 layers of Transformer Encoder stacked on top of each other. The layers are indexed from 0 to 11 (12 layers in total).
-#         (self_attn): MultiheadAttention(
-#           (out_proj): NonDynamicallyQuantizableLinear(in_features=512, out_features=512, bias=True)
-#         )
-#         (linear1): Linear(in_features=512, out_features=512, bias=True)
-#         (dropout): Dropout(p=0.2, inplace=False)
-#         (linear2): Linear(in_features=512, out_features=512, bias=True)
-#         (norm1): LayerNorm((512,), eps=1e-05, elementwise_affine=True)
-#         (norm2): LayerNorm((512,), eps=1e-05, elementwise_affine=True)
-#         (dropout1): Dropout(p=0.2, inplace=False)
-#         (dropout2): Dropout(p=0.2, inplace=False)
-#       )
-#     )
-#   )
+TransformerModel(
+  (encoder): GeneEncoder(
+    (embedding): Embedding(60697, 512, padding_idx=60694) # The number 60697 is the size of the gene vocabulary in the pretrained model with 512 dimensions
+    (enc_norm): LayerNorm((512,), eps=1e-05, elementwise_affine=True) # LayerNorm (short for Layer Normalization) normalizes the inputs across features (the 512 dimensions in your case) for each data point individually.
+    #  It then applies a learnable scale and bias (elementwise_affine=True) to allow the model to shift/stretch the values as needed. 
+    # eps is to prevent from normaliztion
+  )
+  (value_encoder): ContinuousValueEncoder(
+    (dropout): Dropout(p=0.2, inplace=False) # Dropout randomly "drops" (sets to zero) a fraction of the neurons in a layer during each forward pass of the model. This forces the model to learn more robust features and prevents the model from becoming too dependent on specific neurons, which can lead to overfitting.
+    (linear1): Linear(in_features=1, out_features=512, bias=True) ### here it takes 1 gene expression value from each gene for each cell and transforms to 512 dimension provide continous representation of gene expression.
+    (activation): ReLU() ### This adds the non linearity in the model to learn it in a better way
+    (linear2): Linear(in_features=512, out_features=512, bias=True)
+    (norm): LayerNorm((512,), eps=1e-05, elementwise_affine=True)
+    '''
+    The ValueEncoder transforms the continuous gene expression values into embeddings that align with the gene embeddings produced by the GeneEncoder. 
+    These embeddings will help the Transformer model understand the relationships between the genes in terms of both their identity and their expression levels.
+    '''
+  )
+  (batch_encoder): BatchLabelEncoder(
+    (embedding): Embedding(156, 512) ### 156 batches on 512 dimensions
+    (enc_norm): LayerNorm((512,), eps=1e-05, elementwise_affine=True)
+    '''
+    Instead of applying a single batch normalization layer to the entire input, DomainSpecificBatchNorm1d applies a separate BatchNorm for each batch label (domain). 
+    This could be useful in situations where you have data from different sources or conditions (i.e., different "domains") and you want to normalize the features
+    separately for each domain.
+    '''
+  (dsbn): DomainSpecificBatchNorm1d(
+    (bns): ModuleList(
+      (0-155): 156 x BatchNorm1d(512, eps=6.1e-05, momentum=0.1, affine=False, track_running_stats=True)
+    )
+  )
+#   After the GeneEncoder, ValueEncoder, and BatchEncoder produce their respective embeddings, the outputs are combined. These combined embeddings are fed into the Transformer Encoder, and the Multihead Attention mechanism begins.
+  (transformer_encoder): TransformerEncoder(
+    (layers): ModuleList(
+      (0-11): 12 x TransformerEncoderLayer( # ModuleList: This is a container that holds the 12 Transformer Encoder layers. So, the model has 12 layers of Transformer Encoder stacked on top of each other. The layers are indexed from 0 to 11 (12 layers in total).
+        (self_attn): MultiheadAttention(
+          (out_proj): NonDynamicallyQuantizableLinear(in_features=512, out_features=512, bias=True)
+        )
+        (linear1): Linear(in_features=512, out_features=512, bias=True)
+        (dropout): Dropout(p=0.2, inplace=False)
+        (linear2): Linear(in_features=512, out_features=512, bias=True)
+        (norm1): LayerNorm((512,), eps=1e-05, elementwise_affine=True)
+        (norm2): LayerNorm((512,), eps=1e-05, elementwise_affine=True)
+        (dropout1): Dropout(p=0.2, inplace=False)
+        (dropout2): Dropout(p=0.2, inplace=False)
+      )
+    )
+  )
 '''
 How the GeneEncoder, ValueEncoder, and BatchEncoder Interact in Multihead Attention:
 When the embeddings from the GeneEncoder, ValueEncoder, and BatchEncoder are passed into the Transformer Encoder:
@@ -576,85 +491,73 @@ MVCDecoder: Focuses on generating predictions for multi-view consistency, useful
 Adversarial Discriminator: Helps the model to learn domain-invariant representations, likely used for batch effect mitigation.
 Similarity: Computes cosine similarity between vectors, used for measuring how similar predicted outputs are.
 CrossEntropyLoss: Used to train the Adversarial Discriminator for batch prediction tasks.
+
+ MVCDecoder (Multi-View Consistency Decoder):
+    This decoder is responsible for generating multi-view consistency predictions. It seems like it might be used to learn a representation of gene expressions under different conditions or views.
+    The discriminator helps the model learn to distinguish features that are invariant to domain shifts (e.g., batch-specific variations in gene expression). This is 
+    helpful if your data has significant batch effects, and you want to learn representations that generalize well across different batches.
+
+
 '''
-#   (decoder): ExprDecoder(
-#     (fc): Sequential(
-#       (0): Linear(in_features=1024, out_features=512, bias=True)
-#       (1): LeakyReLU(negative_slope=0.01) ## To introduce non-linearity
-#       (2): Linear(in_features=512, out_features=512, bias=True)
-#       (3): LeakyReLU(negative_slope=0.01)
-#       (4): Linear(in_features=512, out_features=1, bias=True)
-#     )
-#     (zero_logit): Sequential(
-#       (0): Linear(in_features=1024, out_features=512, bias=True)
-#       (1): LeakyReLU(negative_slope=0.01)
-#       (2): Linear(in_features=512, out_features=512, bias=True)
-#       (3): LeakyReLU(negative_slope=0.01)
-#       (4): Linear(in_features=512, out_features=1, bias=True)
-#     )
-#   )
-#   (cls_decoder): ClsDecoder(
-#     (_decoder): ModuleList(
-#       (0): Linear(in_features=512, out_features=512, bias=True)
-#       (1): ReLU()
-#       (2): LayerNorm((512,), eps=1e-05, elementwise_affine=True)
-#       (3): Linear(in_features=512, out_features=512, bias=True)
-#       (4): ReLU()
-#       (5): LayerNorm((512,), eps=1e-05, elementwise_affine=True)
-#     )
-#     (out_layer): Linear(in_features=512, out_features=1, bias=True)
-#   )
-#   # MVCDecoder (Multi-View Consistency Decoder):
-#     # This decoder is responsible for generating multi-view consistency predictions. It seems like it might be used to learn a representation of gene expressions under different conditions or views.
-#     # The discriminator helps the model learn to distinguish features that are invariant to domain shifts (e.g., batch-specific variations in gene expression). This is 
-#     # helpful if your data has significant batch effects, and you want to learn representations that generalize well across different batches.
-#   (mvc_decoder): MVCDecoder(
-#     (gene2query): Linear(in_features=512, out_features=512, bias=True)
-#     (query_activation): Sigmoid()
-#     (W): Linear(in_features=512, out_features=1024, bias=False)
-#     (W_zero_logit): Linear(in_features=512, out_features=1024, bias=True)
-#   )
-#   (grad_reverse_discriminator): AdversarialDiscriminator(
-#     (_decoder): ModuleList(
-#       (0): Linear(in_features=512, out_features=512, bias=True)
-#       (1): LeakyReLU(negative_slope=0.01)
-#       (2): LayerNorm((512,), eps=1e-05, elementwise_affine=True)
-#       (3): Linear(in_features=512, out_features=512, bias=True)
-#       (4): LeakyReLU(negative_slope=0.01)
-#       (5): LayerNorm((512,), eps=1e-05, elementwise_affine=True)
-#     )
-#     (out_layer): Linear(in_features=512, out_features=156, bias=True)
-#   )
-#     #   After the model processes the data, the cosine similarity can be used to measure how similar the predicted output is to some reference (or between different parts of the model's output).
-#   (sim): Similarity(
-#     (cos): CosineSimilarity()
-#   )
-#   (creterion_cce): CrossEntropyLoss()
-# )
-# mean squared error 
-# criterion_dab: Standard cross-entropy loss, used for classification tasks like:
-# domain classification
-# cell type prediction (cls_decoder or grad_reverse_discriminator)
+  (decoder): ExprDecoder(
+    (fc): Sequential(
+      (0): Linear(in_features=1024, out_features=512, bias=True)
+      (1): LeakyReLU(negative_slope=0.01) ## To introduce non-linearity
+      (2): Linear(in_features=512, out_features=512, bias=True)
+      (3): LeakyReLU(negative_slope=0.01)
+      (4): Linear(in_features=512, out_features=1, bias=True)
+    )
+    (zero_logit): Sequential(
+      (0): Linear(in_features=1024, out_features=512, bias=True)
+      (1): LeakyReLU(negative_slope=0.01)
+      (2): Linear(in_features=512, out_features=512, bias=True)
+      (3): LeakyReLU(negative_slope=0.01)
+      (4): Linear(in_features=512, out_features=1, bias=True)
+    )
+  )
+  (cls_decoder): ClsDecoder(
+    (_decoder): ModuleList(
+      (0): Linear(in_features=512, out_features=512, bias=True)
+      (1): ReLU()
+      (2): LayerNorm((512,), eps=1e-05, elementwise_affine=True)
+      (3): Linear(in_features=512, out_features=512, bias=True)
+      (4): ReLU()
+      (5): LayerNorm((512,), eps=1e-05, elementwise_affine=True)
+    )
+    (out_layer): Linear(in_features=512, out_features=1, bias=True)
+  )
+  (mvc_decoder): MVCDecoder(
+    (gene2query): Linear(in_features=512, out_features=512, bias=True)
+    (query_activation): Sigmoid()
+    (W): Linear(in_features=512, out_features=1024, bias=False)
+    (W_zero_logit): Linear(in_features=512, out_features=1024, bias=True)
+  )
+  (grad_reverse_discriminator): AdversarialDiscriminator(
+    (_decoder): ModuleList(
+      (0): Linear(in_features=512, out_features=512, bias=True)
+      (1): LeakyReLU(negative_slope=0.01)
+      (2): LayerNorm((512,), eps=1e-05, elementwise_affine=True)
+      (3): Linear(in_features=512, out_features=512, bias=True)
+      (4): LeakyReLU(negative_slope=0.01)
+      (5): LayerNorm((512,), eps=1e-05, elementwise_affine=True)
+    )
+    (out_layer): Linear(in_features=512, out_features=156, bias=True)
+  )
+    #   After the model processes the data, the cosine similarity can be used to measure how similar the predicted output is to some reference (or between different parts of the model's output).
+  (sim): Similarity(
+    (cos): CosineSimilarity()
+  )
+  (creterion_cce): CrossEntropyLoss()
+)
+
 criterion = masked_mse_loss
 criterion_dab = nn.CrossEntropyLoss()
 optimizer = torch.optim.Adam(
     model.parameters(), lr=config.lr, eps=1e-4 if config.amp else 1e-8
 )
-# Reduces the learning rate every epoch (step_size=1)
-# Multiplies LR by gamma=config.schedule_ratio (e.g., 0.9 = 10% decay per epoch)
 scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1, gamma=config.schedule_ratio)
 scaler = torch.cuda.amp.GradScaler(enabled=config.amp)
-# AMP = Automatic Mixed Precision
-# GradScaler handles dynamic scaling of gradients to prevent underflow/overflow
-# Only enabled if config.amp == True
-# Mixed-precision training can give a big speed boost on GPUs without sacrificing much accuracy.
 
-# Component	Purpose
-# criterion	Regression loss (masked MSE)
-# criterion_dab	Classification loss (CrossEntropy)
-# optimizer	Parameter updates (Adam)
-# scheduler	Decays learning rate each epoch
-# scaler	Scales gradients for AMP stability
 
 #endregion
 
@@ -1028,5 +931,3 @@ gc.collect()
 
 
 #endregion
-
-
