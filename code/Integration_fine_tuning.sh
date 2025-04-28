@@ -14,5 +14,5 @@ conda init
 conda activate /diazlab/data3/.abhinav/tools/miniconda3/envs/py_r_env/
 
 cd /diazlab/data3/.abhinav/projects/Brain_metastasis/
-# pretrain epitope masked language model.
+# Fine Tuning Integration
 python /diazlab/data3/.abhinav/projects/Brain_metastasis/brain_metastasis_fine_tuning.py
