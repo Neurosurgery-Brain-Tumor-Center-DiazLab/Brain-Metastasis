@@ -84,6 +84,90 @@ hyperparameter_defaults = dict(
     amp=True,  # # Default setting: Automatic Mixed Precision
 )
 
+# GEP & GEPC → capture gene-level biology.
+# ECS → enforce meaningful cell embeddings.
+# DAR → explicitly remove batch signal.
+# DSBN → normalize per-batch while keeping global embedding space stable.
+# GEPC: Masked gene prediction → learns gene dependencies.
+# ECS: Contrastive similarity → clusters of similar cells.
+# In the embedding space (like the 512-dim scGPT embeddings):
+# Cosine similarity measures the angle between two vectors.
+# Closer direction → similarity close to 1.
+# Orthogonal → similarity near 0.
+# Opposite → similarity near -1.
+# Positive pairs → high cosine similarity.
+# Negative pairs → low cosine similarity.
+# Connection to KNN
+# In Scanpy, when you call sc.pp.neighbors, it typically uses Euclidean distance (or PCA-Euclidean) to construct the KNN graph.
+# In contrastive learning (ECS), scGPT focuses on cosine similarity to define closeness in the latent space.
+
+# Both are about closeness in embedding space.
+# Cosine similarity cares about direction (patterns of expression).
+# Euclidean distance cares about absolute magnitude and scale.
+# DAR / DAB: Gradient reversal → removes batch effect.
+# Mask ratio: Forces model to infer missing expression, like BERT masking.
+# AMP: Mixed precision training → faster and more memory efficient.
+
+# Model architecture parameters
+# layer_size=128
+# This is the hidden dimension of the transformer model.
+# Every embedding vector and every hidden state will be 128-dimensional.
+# Larger layer_size = more model capacity, but slower + more memory.
+# nlayers=4
+# Number of transformer encoder layers (stacked blocks).
+# Each layer has: multi-head attention + feed-forward network + normalization.
+# More layers = deeper model, better representation capacity, but slower.
+# nhead=4
+# Number of attention heads in multi-head self-attention.
+# Each head learns a different type of relationship (e.g., co-expression, anti-correlation).
+# layer_size / nhead = dimension per head (here: 128/4 = 32).
+# dropout=0.2
+# Probability of dropping out neurons during training (20%).
+# Helps avoid overfitting by preventing reliance on specific neurons.
+# 🔹 Training schedule parameters
+# schedule_ratio=0.9
+# Controls learning rate decay.
+# Means: over training, the learning rate is reduced to 90% of its original value (exponential or cosine schedule depending on implementation).
+# Prevents overshooting and stabilizes convergence.
+# save_eval_interval=5
+# Evaluate & save the model every 5 epochs.
+# Useful for monitoring progress (e.g., losses, metrics).
+# log_interval=100
+# Print training logs (loss, lr, etc.) every 100 batches.
+# Doesn’t affect training itself, just reporting.
+
+
+# layer_size = width of embeddings/hidden states.
+# nlayers = depth (# of transformer blocks).
+# nhead = # of parallel attention mechanisms.
+# dropout = regularization to prevent overfitting.
+# schedule_ratio = learning rate decay factor.
+# save_eval_interval = how often to save & evaluate the model.
+# log_interval = how often to print progress.
+
+# 1. Learning rate (LR)
+# The learning rate controls how big a step the optimizer takes when updating weights.
+# High LR → fast learning but risk of overshooting minima.
+# Low LR → stable but slow learning.
+# Example:
+# If LR = 0.1, and gradient = 5 → weight update = 0.5.
+# If LR = 0.001, with the same gradient → update = 0.005.
+# So LR decides the step size in gradient descent.
+# 2. Decay rate (schedule ratio = 0.9 in your case)
+# The LR is usually not kept constant → it’s decayed during training.
+# Decay prevents overshooting later and helps fine-tune around minima.
+# With a schedule ratio of 0.9, LR shrinks by 10% every scheduled step.
+# Example:
+#  Initial LR = 0.01
+# After 1st step → 0.01×0.9=0.0090.01 \times 0.9 = 0.0090.01×0.9=0.009
+# After 2nd step → 0.009×0.9=0.00810.009 \times 0.9 = 0.00810.009×0.9=0.0081
+# After 3rd step → 0.0081×0.9=0.007290.0081 \times 0.9 = 0.007290.0081×0.9=0.00729
+# This is exponential decay of LR.
+# LR starts high → model learns quickly.
+# Then LR decays → model fine-tunes carefully near optimal solution.
+# The cell embedding is derived from the <cls> token output, which summarizes the whole cell by integrating information from all gene embeddings.
+# So <cls> is not itself a gene embedding, but a “summary embedding” that becomes the cell representation.
+
 # settings for input and preprocessing
 os.environ["WANDB_MODE"] = "offline"
 run = wandb.init(
