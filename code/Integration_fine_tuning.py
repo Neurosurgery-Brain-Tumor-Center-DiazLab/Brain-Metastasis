@@ -364,6 +364,11 @@ logger.info(
 # To take pre-tokenized gene expression data (tokenized_train and tokenized_valid), randomly mask values, prepare input and target tensors, and return dictionaries 
 # ready for model training.
 
+# This function prepares training & validation batches where:
+# gene_ids → tokens representing which genes are present.
+# values → masked expression levels (input to model).
+# target_values → true expression levels (used for loss).
+# batch_labels → batch IDs (used for domain-adversarial training).
 
 def prepare_data(sort_seq_batch=False) -> Tuple[Dict[str, torch.Tensor]]:
     masked_values_train = random_mask_value(
@@ -393,6 +398,10 @@ def prepare_data(sort_seq_batch=False) -> Tuple[Dict[str, torch.Tensor]]:
     )
     tensor_batch_labels_train = torch.from_numpy(train_batch_labels).long()
     tensor_batch_labels_valid = torch.from_numpy(valid_batch_labels).long()
+    # If enabled, sorts cells by batch ID → useful for grouping during training.
+    # Mostly for optimization efficiency.
+    # Labels for which batch each cell belongs to.
+    # Used for Domain Adversarial (DAR) objective → correct batch effects with gradient reversal.
     if sort_seq_batch:
         train_sort_ids = np.argsort(train_batch_labels)
         input_gene_ids_train = input_gene_ids_train[train_sort_ids]
@@ -423,6 +432,8 @@ def prepare_data(sort_seq_batch=False) -> Tuple[Dict[str, torch.Tensor]]:
 # Stores a dictionary of tensors (like from prepare_data())
 # Implements PyTorch's Dataset interface
 # At each index, returns a dictionary of tensors for that sample to be used for the training.
+# dataset[5]  
+# {"gene_ids": tensor([...]), "values": tensor([...]), "target_values": tensor([...]), "batch_labels": 2}
 class SeqDataset(Dataset):
     def __init__(self, data: Dict[str, torch.Tensor]):
         self.data = data
@@ -432,6 +443,7 @@ class SeqDataset(Dataset):
         return {k: v[idx] for k, v in self.data.items()}
 
 # data_loader
+# adata → tensors → dataset → dataloader → model
 def prepare_dataloader(
     data_pt: Dict[str, torch.Tensor],
     batch_size: int,
@@ -443,16 +455,20 @@ def prepare_dataloader(
     dataset = SeqDataset(data_pt)
     if per_seq_batch_sample:
         # find the indices of samples in each seq batch
+        # Groups samples (cells) by batch label.
         subsets = []
         batch_labels_array = data_pt["batch_labels"].numpy()
         for batch_label in np.unique(batch_labels_array):
             batch_indices = np.where(batch_labels_array == batch_label)[0].tolist()
             subsets.append(batch_indices)
+        # intra_subset_shuffle = shuffle within each batch domain.
+        # inter_subset_shuffle = shuffle across batches.
+        # This is useful for balanced sampling, so batches during training contain cells fairly from each dataset/batch.
         data_loader = DataLoader(
             dataset=dataset,
             batch_sampler=SubsetsBatchSampler(
                 subsets,
-                batch_size,
+                batch_size, # number of cells loading to the model for training
                 intra_subset_shuffle=intra_domain_shuffle,
                 inter_subset_shuffle=shuffle,
                 drop_last=drop_last,
@@ -471,6 +487,19 @@ def prepare_dataloader(
     )
     return data_loader
 
+'''
+drop_last
+Definition: Whether to drop the last incomplete batch if the dataset size isn’t divisible by batch_size.
+Example:
+Dataset = 10 cells, batch_size=4.
+Batches: [cells 1–4], [cells 5–8], [cells 9–10].
+Last batch only has 2 cells.
+If drop_last=False → you keep [9, 10] as a smaller batch.
+If drop_last=True → you throw away [9, 10], so all batches are exactly size 4.
+Why would you drop the last batch?
+Some training code assumes all batches are the same size (matrix operations fail if dimensions don’t match).
+It can also stabilize training when using batch normalization, since very tiny batches give noisy statistics.
+'''
 
 ## Step 3: Load the pre-trained scGPT model
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -511,7 +540,15 @@ wandb.watch(model)
 # grad_reverse_discriminator: Adversarial batch/domain classifier
 # sim: Similarity scorer (e.g., for contrastive or triplet learning)
 # creterion_cce: Loss function (CrossEntropy)
-
+'''
+Gene IDs → GeneEncoder
+Expression values → ValueEncoder
+Batch IDs → BatchEncoder
+↓
+Combine embeddings → Transformer Encoder (12 layers)
+↓
+[CLS] embedding = Cell embedding
+'''
 TransformerModel(
   (encoder): GeneEncoder(
     (embedding): Embedding(60697, 512, padding_idx=60694) # The number 60697 is the size of the gene vocabulary in the pretrained model with 512 dimensions
@@ -546,7 +583,9 @@ TransformerModel(
 #   After the GeneEncoder, ValueEncoder, and BatchEncoder produce their respective embeddings, the outputs are combined. These combined embeddings are fed into the Transformer Encoder, and the Multihead Attention mechanism begins.
   (transformer_encoder): TransformerEncoder(
     (layers): ModuleList(
-      (0-11): 12 x TransformerEncoderLayer( # ModuleList: This is a container that holds the 12 Transformer Encoder layers. So, the model has 12 layers of Transformer Encoder stacked on top of each other. The layers are indexed from 0 to 11 (12 layers in total).
+      (0-11): 12 x TransformerEncoderLayer( 
+      # ModuleList: This is a container that holds the 12 Transformer Encoder layers. So, the model has 12 layers of Transformer Encoder stacked on top of each other. The layers are indexed from 0 to 11 (12 layers in total).
+      # Earlier in the hyper parameter it is 4 encoder blocks. But 12 layer of encoder blocks represents that model was pretrained on 12 encoder block and in fine-tuning you use 4 encoder blocks
         (self_attn): MultiheadAttention(
           (out_proj): NonDynamicallyQuantizableLinear(in_features=512, out_features=512, bias=True)
         )
@@ -581,9 +620,12 @@ CrossEntropyLoss: Used to train the Adversarial Discriminator for batch predicti
     The discriminator helps the model learn to distinguish features that are invariant to domain shifts (e.g., batch-specific variations in gene expression). This is 
     helpful if your data has significant batch effects, and you want to learn representations that generalize well across different batches.
 
-
 '''
   (decoder): ExprDecoder(
+      # Purpose: Predict gene expression values for masked genes (Masked Value Prediction, like MLM in BERT).
+      # fc branch: Predicts the actual continuous expression value of the gene.
+      # zero_logit branch: Predicts whether a gene is expressed or not (zero vs non-zero expression).
+      # Single-cell RNA-seq data is very sparse (lots of zeros due to dropout), so having this branch helps the model handle sparsity better.
     (fc): Sequential(
       (0): Linear(in_features=1024, out_features=512, bias=True)
       (1): LeakyReLU(negative_slope=0.01) ## To introduce non-linearity
@@ -600,6 +642,11 @@ CrossEntropyLoss: Used to train the Adversarial Discriminator for batch predicti
     )
   )
   (cls_decoder): ClsDecoder(
+      # Purpose: Decode the [CLS] token embedding into higher-level predictions.
+      # Examples:
+      # Cell type classification
+      # Predicting a biological label (like disease state, condition, etc.)
+      # The out_layer reduces the 512-dim CLS embedding → 1 (binary classification) or more (if multi-class).
     (_decoder): ModuleList(
       (0): Linear(in_features=512, out_features=512, bias=True)
       (1): ReLU()
@@ -611,6 +658,18 @@ CrossEntropyLoss: Used to train the Adversarial Discriminator for batch predicti
     (out_layer): Linear(in_features=512, out_features=1, bias=True)
   )
   (mvc_decoder): MVCDecoder(
+    # Purpose: Supports contrastive learning by aligning representations from multiple “views” of the data.
+    # e.g., a cell might be represented by its genes and by its expression values → the model learns consistent embeddings across these “views.”
+    # gene2query: Projects embeddings into a query space.
+    # W and W_zero_logit: Help reconstruct features under different masking strategies.
+    # Here, the decoder doesn’t reduce to a single scalar.
+    # Instead, it projects the embedding into a higher-dimensional "query space" (1024 dims).
+    # This creates richer representations for contrastive similarity calculations (cosine similarity, InfoNCE loss, etc.).
+    # The model compares embeddings in this 1024-D space to check if two views of the same cell are "close" or not.
+    #  Think of it like this:
+    # ExprDecoder → “What is the number for this gene?”
+    # ClsDecoder → “What is the label for this cell?”
+    # MVCDecoder → “Give me a rich vector representation so I can compare cells in different views.”
     (gene2query): Linear(in_features=512, out_features=512, bias=True)
     (query_activation): Sigmoid()
     (W): Linear(in_features=512, out_features=1024, bias=False)
@@ -641,14 +700,20 @@ optimizer = torch.optim.Adam(
 )
 scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1, gamma=config.schedule_ratio)
 scaler = torch.cuda.amp.GradScaler(enabled=config.amp)
-
-
 #endregion
 
 #region training the model
 def train(model: nn.Module, loader: DataLoader) -> None:
     """
     Train the model for one epoch.
+    This function trains the model for one epoch:
+    Loops over mini-batches from the DataLoader.
+    Moves data to GPU (device).
+    Runs a forward pass through the model → gets predictions (output_dict).
+    Computes different losses depending on tasks enabled (MLM, GEPC, ECS, DAB…).
+    Sums them up → total loss.
+    Runs backpropagation → updates weights.
+    Logs metrics along the way (loss, MSE, etc.).
     """
     # Initialization
     model.train()
@@ -671,12 +736,20 @@ def train(model: nn.Module, loader: DataLoader) -> None:
             mlm_output: main prediction (masked value prediction)
             mlm_zero_probs: predicted zero probability
             mvc_output: GEPC output (if enabled)
-            GEPC stands  for Gene Expression Prediction from Context.
+            GEPC stands for Gene Expression Prediction from Context.
             It's a kind of auxiliary training objective used in models like scGPT to improve the model’s understanding of gene-gene relationships and help it generalize better.
             dab_output: classification (e.g., domain)
             loss_ecs: extra constraint loss (if enabled)
         """
         with torch.cuda.amp.autocast(enabled=config.amp):
+            # forward passs
+            '''
+            mlm_output → predictions for masked values.
+            mlm_zero_probs → predicts if a gene is truly zero (dropout) vs masked.
+            mvc_output → GEPC auxiliary predictions.
+            dab_output → domain classifier output (for adversarial batch correction).
+            loss_ecs → extra loss if elastic cell similarity is enabled.
+            '''
             output_dict = model(
                 input_gene_ids,
                 input_values,
@@ -686,9 +759,23 @@ def train(model: nn.Module, loader: DataLoader) -> None:
                 ECS=config.ecs_thres > 0,
             )
             masked_positions = input_values.eq(mask_value)  # the postions to predict
-            loss = loss_mse = criterion(
+            loss = loss_mse = criterion( #Standard MSE loss → predict the masked expression values.
+                # Even though the inputs are tokenized, scGPT’s main objective is to predict continuous expression values. 
+                # That’s why MSE is the core loss. Cross-entropy is used only for side tasks (batch classification, zero inflation).
                 output_dict["mlm_output"], target_values, masked_positions
             )
+            '''
+            Extra loss terms (conditional)
+            Zero probability loss (Bernoulli log-likelihood):
+            Encourages model to distinguish true zeros from masked ones.
+            GEPC (Gene Expression Prediction from Context):
+            Extra regression loss on mvc_output.
+            GEPC zero prob loss: same as above but for zero logits.
+            ECS (Elastic Cell Similarity):
+            Contrastive loss → similar cells closer in embedding space.
+            DAB (Domain Adversarial Batch correction):
+            Cross-entropy loss from batch classifier head, scaled by dab_weight.
+            ''''
             metrics_to_log = {"train/mse": loss_mse.item()}
             if explicit_zero_prob:
                 loss_zero_log_prob = criterion_neg_log_bernoulli(
@@ -715,8 +802,12 @@ def train(model: nn.Module, loader: DataLoader) -> None:
                 loss = loss + loss_ecs
                 metrics_to_log.update({"train/ecs": loss_ecs.item()})
             loss_dab = criterion_dab(output_dict["dab_output"], batch_labels)
-            loss = loss + config.dab_weight * loss_dab
+            loss = loss + config.dab_weight * loss_dab # combined loss
             metrics_to_log.update({"train/dab": loss_dab.item()})
+        # Backpropagation
+        # Uses AMP (Automatic Mixed Precision) for faster training on GPU.
+        # Clip gradients to prevent exploding gradients.
+        # Optimizer step updates model weights.
         model.zero_grad()
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -763,6 +854,13 @@ def train(model: nn.Module, loader: DataLoader) -> None:
             total_gepc = 0
             total_error = 0
             start_time = time.time()
+
+# This training loop is multi-task:
+# 🎯 Regression (MLM, GEPC) → predict expression.
+# 🎯 Adversarial classification (DAB) → remove batch effect.
+# 🎯 Contrastive (ECS) → keep biological neighbors close.
+# 🎯 Zero vs masked discrimination → better dropout modeling.
+# The final training signal is the weighted combination of all these objectives.
 
 def define_wandb_metrcis():
     wandb.define_metric("valid/mse", summary="min", step_metric="epoch")
