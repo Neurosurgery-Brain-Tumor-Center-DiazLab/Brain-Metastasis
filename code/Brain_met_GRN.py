@@ -61,8 +61,6 @@ n_input_bins = n_bins
 
 
 # Step 1: Load pre-trained model and dataset
-
-
 # Specify model path; here we load the pre-trained scGPT blood model
 model_dir = Path("/diazlab/data3/.abhinav/projects/Brain_metastasis/scgpt/resources/scGPT_CP/")
 model_config_file = model_dir / "args.json"
@@ -205,7 +203,7 @@ gdata = embed.get_adata(resolution=40)
 # Retrieve the gene clusters
 metagenes = embed.get_metagenes(gdata)
 
-# Obtain the set of gene programs from clusters with #genes >= 5
+# Obtain the set of gene programs from clusters with #genes >= 10
 mgs = dict()
 for mg, genes in metagenes.items():
     if len(genes) > 10:
